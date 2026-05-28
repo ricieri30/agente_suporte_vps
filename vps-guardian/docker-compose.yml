@@ -1,0 +1,60 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vps-guardian-backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - backup-volume:/var/backups/vps-guardian
+      - ./backend/logs:/app/logs
+      - /:/rootfs:ro   # disco do host (VPS) para métricas reais de disco
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3000
+      BACKUP_DIR: /var/backups/vps-guardian
+      MAX_BACKUPS: ${MAX_BACKUPS:-6}
+      WEBHOOK_ENABLED: ${WEBHOOK_ENABLED:-false}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_TYPE: ${WEBHOOK_TYPE:-slack}
+      CPU_THRESHOLD: ${CPU_THRESHOLD:-90}
+      MEMORY_THRESHOLD: ${MEMORY_THRESHOLD:-90}
+      DISK_THRESHOLD: ${DISK_THRESHOLD:-85}
+    networks:
+      - vps-guardian
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vps-guardian-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    networks:
+      - vps-guardian
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  backup-volume:
+    driver: local
+
+networks:
+  vps-guardian:
+    driver: bridge
