@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import {
   Database, Plus, RefreshCw, Trash2, RotateCcw, Calendar,
-  FileArchive, HardDrive, Logs, Settings2, Box, ChevronDown
+  FileArchive, HardDrive, Terminal, Settings2, Box, ChevronDown
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import axios from 'axios'
@@ -21,7 +21,7 @@ const BACKUP_TYPES = [
     key: 'logs',
     label: 'Somente Logs',
     description: 'Apenas os logs gerados pela aplicação (/app/logs)',
-    icon: Logs,
+    icon: Terminal,
     color: 'text-green-500',
     badge: 'bg-green-500/10 text-green-400 border-green-500/20'
   },
