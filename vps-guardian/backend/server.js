@@ -120,6 +120,17 @@ scheduleBackupCron();
 const activeAlerts = new Map();
 let criticalAlertsCount = 0;
 
+function escapeHtml(unsafe) {
+  if (!unsafe) return '';
+  return unsafe
+    .toString()
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 // Webhook slack/discord
 async function sendWebhook(level, title, message) {
   if (!globalSettings.webhookEnabled || !globalSettings.webhookUrl) return;
@@ -155,12 +166,13 @@ async function sendTelegramAlert(level, title, message) {
   if (!globalSettings.telegramEnabled || !globalSettings.telegramBotToken || !globalSettings.telegramChatId) return;
   try {
     const emoji = level === 'critical' ? '🔴' : level === 'warning' ? '🟡' : '🟢';
-    const text = `${emoji} *${level.toUpperCase()}: ${title}*\n\n${message}\n\n_Host: VPS Guardian_`;
+    // Telegram HTML parsing é muito mais estável que Markdown (não quebra com underscores nos nomes dos containers)
+    const text = `${emoji} <b>${escapeHtml(level.toUpperCase())}: ${escapeHtml(title)}</b>\n\n${escapeHtml(message)}\n\n<i>Host: VPS Guardian</i>`;
     const url = `https://api.telegram.org/bot${globalSettings.telegramBotToken}/sendMessage`;
     await axios.post(url, {
       chat_id: globalSettings.telegramChatId,
       text: text,
-      parse_mode: 'Markdown'
+      parse_mode: 'HTML'
     });
     logger.info('🔔 Alerta enviado via Telegram');
   } catch (e) {
@@ -173,22 +185,25 @@ async function sendEmailAlert(level, title, message) {
   if (!globalSettings.emailEnabled || !globalSettings.smtpHost || !globalSettings.smtpTo) return;
   try {
     const nodemailer = require('nodemailer');
-    const transporter = nodemailer.createTransport({
+    const mailConfig = {
       host: globalSettings.smtpHost,
-      port: globalSettings.smtpPort || 587,
+      port: parseInt(globalSettings.smtpPort) || 587,
       secure: parseInt(globalSettings.smtpPort) === 465,
-      auth: {
+    };
+    if (globalSettings.smtpUser) {
+      mailConfig.auth = {
         user: globalSettings.smtpUser,
-        pass: globalSettings.smtpPass
-      }
-    });
+        pass: globalSettings.smtpPass || ''
+      };
+    }
+    const transporter = nodemailer.createTransport(mailConfig);
 
     const subject = `[Guardian] ${level.toUpperCase()}: ${title}`;
     const color = level === 'critical' ? '#ef4444' : level === 'warning' ? '#f59e0b' : '#22c55e';
     const html = `
       <div style="font-family: sans-serif; padding: 25px; background-color: #0f172a; color: #f8fafc; border-radius: 8px; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b;">
-        <h2 style="color: ${color}; margin-top: 0; border-bottom: 1px solid #1e293b; padding-bottom: 15px;">${title}</h2>
-        <p style="font-size: 16px; line-height: 1.6; color: #cbd5e1;">${message}</p>
+        <h2 style="color: ${color}; margin-top: 0; border-bottom: 1px solid #1e293b; padding-bottom: 15px;">${escapeHtml(title)}</h2>
+        <p style="font-size: 16px; line-height: 1.6; color: #cbd5e1; white-space: pre-wrap;">${escapeHtml(message)}</p>
         <hr style="border: 0; border-top: 1px solid #1e293b; margin: 25px 0;" />
         <p style="font-size: 12px; color: #64748b; margin-bottom: 0;">Notificação gerada automaticamente pelo VPS Guardian.<br/>Host: VPS Guardian</p>
       </div>
@@ -270,28 +285,69 @@ function checkThresholds(metrics) {
 
 // ==================== Auto-Restart de Containers ====================
 const lastContainerStates = new Map();
+const restartTracker = new Map();
 
 async function checkContainersAutoRestart() {
   try {
     const containers = await docker.listContainers({ all: true });
+    const now = Date.now();
     for (const c of containers) {
       const id = c.Id.substring(0, 12);
       const name = c.Names[0]?.replace('/', '') || 'unknown';
       const currentState = c.State;
       const prevState = lastContainerStates.get(id);
 
+      // Se o container voltou a rodar normalmente por mais de 10 minutos, limpa o rastreador de restarts
+      const tracking = restartTracker.get(id);
+      if (currentState === 'running' && tracking && now - tracking.lastAttempt > 600000) {
+        restartTracker.delete(id);
+      }
+
       if (prevState === 'running' && currentState === 'exited') {
-        logger.warn(`⚠️ Container caído detectado: ${name} (${id}). Tentando auto-restart...`);
-        broadcastAlert('warning', 'Container Caído', `O container ${name} caiu. Tentando reinício automático...`);
+        logger.warn(`⚠️ Container caído detectado: ${name} (${id}).`);
+        
+        let track = restartTracker.get(id) || { count: 0, lastAttempt: 0 };
+        
+        // Cooldown de 5 minutos entre tentativas de auto-restart
+        if (now - track.lastAttempt < 300000) {
+          logger.info(`⏳ Cooldown de auto-restart ativo para o container ${name}. Ignorando tentativa.`);
+          lastContainerStates.set(id, currentState);
+          continue;
+        }
+
+        // Limite de 3 tentativas
+        if (track.count >= 3) {
+          logger.error(`❌ Container ${name} atingiu o limite máximo de 3 tentativas de reinício automático.`);
+          if (track.count === 3) {
+            broadcastAlert('critical', 'Falha Permanente no Container', `O container ${name} falhou permanentemente após atingir o limite de 3 tentativas de auto-restart.`);
+            track.count = 4; // Incrementa para não reenviar este alerta crítico em loop
+            restartTracker.set(id, track);
+          }
+          lastContainerStates.set(id, currentState);
+          continue;
+        }
+
+        track.count++;
+        track.lastAttempt = now;
+        restartTracker.set(id, track);
+
+        logger.warn(`⚠️ Tentando reiniciar automaticamente o container ${name} (Tentativa ${track.count}/3)...`);
+        broadcastAlert('warning', 'Container Caído', `O container ${name} caiu. Tentando reinício automático (Tentativa ${track.count}/3)...`);
         
         try {
           const container = docker.getContainer(c.Id);
           await container.start();
-          logger.info(`✅ Container ${name} reiniciado com sucesso via auto-restart.`);
-          broadcastAlert('info', 'Container Recuperado', `O container ${name} foi reiniciado com sucesso.`);
+          logger.info(`✅ Container ${name} reiniciado com sucesso via auto-restart (Tentativa ${track.count}/3).`);
+          broadcastAlert('info', 'Container Recuperado', `O container ${name} foi reiniciado com sucesso na tentativa ${track.count}/3.`);
         } catch (err) {
-          logger.error(`❌ Falha ao reiniciar container ${name}: ${err.message}`);
-          broadcastAlert('critical', 'Falha no Auto-Restart', `Não foi possível reiniciar o container ${name}. Erro: ${err.message}`);
+          logger.error(`❌ Falha ao reiniciar container ${name} (Tentativa ${track.count}/3): ${err.message}`);
+          if (track.count === 3) {
+            broadcastAlert('critical', 'Falha Permanente no Container', `O container ${name} falhou permanentemente. Não foi possível reiniciar após 3 tentativas. Último erro: ${err.message}`);
+            track.count = 4;
+            restartTracker.set(id, track);
+          } else {
+            broadcastAlert('critical', 'Falha no Auto-Restart', `Não foi possível reiniciar o container ${name} na tentativa ${track.count}/3. Erro: ${err.message}`);
+          }
         }
       }
       lastContainerStates.set(id, currentState);
@@ -498,6 +554,15 @@ app.post('/api/settings/test-email', async (req, res) => {
 // ==================== Backups ====================
 function runBackup(type = 'full', containerId = null) {
   return new Promise(async (resolve, reject) => {
+    // Sanitização de entradas contra command injection
+    const validTypes = ['full', 'logs', 'config', 'container'];
+    if (!validTypes.includes(type)) {
+      return reject(new Error('Tipo de backup inválido.'));
+    }
+    if (containerId && !/^[a-zA-Z0-9_-]+$/.test(containerId)) {
+      return reject(new Error('ID de container inválido para backup.'));
+    }
+
     const backupDir = globalSettings.backupDir;
     if (!fs.existsSync(backupDir)) {
       fs.mkdirSync(backupDir, { recursive: true });
@@ -603,6 +668,16 @@ app.get('/api/backups', (req, res) => {
 app.post('/api/backups', async (req, res) => {
   try {
     const { type, containerId } = req.body;
+    
+    // Strict Input Validation
+    const validTypes = ['full', 'logs', 'config', 'container'];
+    if (type && !validTypes.includes(type)) {
+      return res.status(400).json({ success: false, error: 'Tipo de backup inválido' });
+    }
+    if (containerId && !/^[a-zA-Z0-9_-]+$/.test(containerId)) {
+      return res.status(400).json({ success: false, error: 'ID de container inválido' });
+    }
+
     const result = await runBackup(type || 'full', containerId || null);
     res.json({ success: true, message: 'Backup concluído com sucesso', id: result.id, name: result.filename });
   } catch (error) {
@@ -612,6 +687,11 @@ app.post('/api/backups', async (req, res) => {
 
 app.delete('/api/backups/:id', (req, res) => {
   try {
+    // Sanitização contra Directory Traversal e Command Injection
+    if (!/^[a-zA-Z0-9_-]+$/.test(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'ID de backup inválido' });
+    }
+
     const backupDir = globalSettings.backupDir;
     const filename = `${req.params.id}.tar.gz`;
     const filepath = path.join(backupDir, filename);
@@ -629,6 +709,11 @@ app.delete('/api/backups/:id', (req, res) => {
 
 app.post('/api/backups/:id/restore', async (req, res) => {
   try {
+    // Sanitização contra Directory Traversal e Command Injection
+    if (!/^[a-zA-Z0-9_-]+$/.test(req.params.id)) {
+      return res.status(400).json({ success: false, error: 'ID de backup inválido' });
+    }
+
     const backupDir = globalSettings.backupDir;
     const filename = `${req.params.id}.tar.gz`;
     const filepath = path.join(backupDir, filename);
@@ -691,14 +776,25 @@ function parseStats(stats) {
   try {
     const cpuDelta = stats.cpu_stats.cpu_usage.total_usage - (stats.precpu_stats?.cpu_usage?.total_usage || 0);
     const systemDelta = stats.cpu_stats.system_cpu_usage - (stats.precpu_stats?.system_cpu_usage || 0);
-    const cpuPercent = (cpuDelta / systemDelta) * (stats.cpu_stats.online_cpus || 1) * 100 || 0;
+    
+    // Evita NaN ou divisão por zero caso systemDelta seja 0
+    let cpuPercent = 0;
+    if (systemDelta > 0 && cpuDelta > 0) {
+      cpuPercent = (cpuDelta / systemDelta) * (stats.cpu_stats.online_cpus || 1) * 100;
+    }
+    
+    // Tratamento de segurança para limites reais
+    const parsedCpu = isNaN(cpuPercent) || !isFinite(cpuPercent) ? 0 : Math.max(0, Math.min(cpuPercent, 100));
+
     const memUsage = stats.memory_stats.usage || 0;
     const memLimit = stats.memory_stats.limit || 0;
     const memPercent = memLimit > 0 ? (memUsage / memLimit) * 100 : 0;
+    const parsedMem = isNaN(memPercent) || !isFinite(memPercent) ? 0 : Math.max(0, Math.min(memPercent, 100));
+
     return {
-      cpu: { percent: Math.min(cpuPercent, 100).toFixed(1) },
+      cpu: { percent: parsedCpu.toFixed(1) },
       memory: {
-        percent: Math.min(memPercent, 100).toFixed(1),
+        percent: parsedMem.toFixed(1),
         usage: formatBytes(memUsage), limit: formatBytes(memLimit)
       }
     };
